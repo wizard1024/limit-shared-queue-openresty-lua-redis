@@ -10,26 +10,7 @@ local function expire_key(redis_connection, key, interval, log_level)
     end
 end
 
-local function get_key(redis_connection, key, log_level)
-	local value, error = redis_connection:get(key)
-	if not value then
-		ngx.log(log_level, "Failed to get key: ", error)
-		return
-	end
-	return value
-end
-
-local function set_lock(redis_connection)
-	local lock, error = redis_connection:set("RL:Lock", "Locked", "PX", "1000", "NX")
-	while lock == ngx.null do
-		lock, error = redis_connection:set("RL:Lock", "Locked", "PX", "1000", "NX")
-	end
-end
-
-local function unset_lock(redis_connection)
-	redis_connection:del("RL:Lock")
-end
-
+-- Function to check Parent queue for limits
 local function overlimit(redis_connection, ip_key, rate_max, interval, log_level)
 	local result = false
     	local key = "RL:" .. ip_key
@@ -38,7 +19,6 @@ local function overlimit(redis_connection, ip_key, rate_max, interval, log_level
 	while lock == ngx.null do
 		lock, error = redis_connection:set("RL:Lock", "Locked", "PX", "10000", "NX")
 	end
-	--set_lock(redis_connection)
 	local total, error = redis_connection:incr(keyTotal)	
 	redis_connection:del("RL:Lock")
 	if not total then
@@ -64,11 +44,10 @@ local function overlimit(redis_connection, ip_key, rate_max, interval, log_level
        			end
 		end
 	end
-	--redis_connection:del("RL:Lock")
-	--unset_lock(redis_connection)
 	return result
 end
 
+-- Function to increse class queue and set TTL to key
 local function bump_request(redis_connection, redis_pool_size, ip_key, rate, interval, current_time, log_level)
     local key = "RL:" .. ip_key
 
@@ -100,11 +79,12 @@ local function bump_request(redis_connection, redis_pool_size, ip_key, rate, int
 end
 
 function _M.limit(config)
+    -- We always use limit
     local use_limit = true
 
     if use_limit then
         local log_level = config.log_level or ngx.ERR
-
+	-- Init from nginx config.
         if not config.connection then
             local ok, redis = pcall(require, "resty.redis")
             if not ok then
@@ -142,6 +122,7 @@ function _M.limit(config)
 	local rate = 10
 	local interval = 1
 	local enforce_limit = false
+	-- Determine parameters from config
     	for i,r_i_keys in ipairs(r_i) do
     	    if r_i_keys[1] == key then
     	    	rate = r_i_keys[2]
@@ -150,7 +131,7 @@ function _M.limit(config)
     	    end
 	    rateTotalDec = rateTotalDec - 1;
     	end
-
+	
         local current_time = ngx.now()
         local response, error = bump_request(connection, redis_pool_size, key, rate, interval, current_time, log_level)
         if not response then
@@ -170,7 +151,6 @@ function _M.limit(config)
 	            		ngx.header["Retry-After"] = retry_after
 	            		ngx.status = 429
 	            		ngx.say('{"status_code":25,"status_message":"Your request count (' .. response.count .. ') is over the allowed limit of ' .. rate .. '."}')
-                    		--ngx.log(log_level, "OverLimit: ", response.count)
 				-- Return connection in pool
     				local ok, error = connection:set_keepalive(60000, redis_pool_size)
     				if not ok then
@@ -178,22 +158,10 @@ function _M.limit(config)
     				end
 	            		ngx.exit(ngx.HTTP_OK)
             	 	else
-				--local responseTotal, error = bump_request(connection, redis_pool_size, "Total", r_i, current_time, log_level)
-				--if not responseTotal then
-				--    return
-				--end
 	        		ngx.header["X-RateLimit-Limit"] = rate
 	        		ngx.header["X-RateLimit-Remaining"] = math.floor(response.remaining)
 	        		ngx.header["X-RateLimit-Reset"] = math.floor(response.reset)
 	        		ngx.header["X-RateLimit-Limit-Total"] = rateTotalDec
-	        		--ngx.header["X-RateLimit-Remaining-Total"] = math.floor(responseTotal.remaining)
-            			--ngx.header["X-RateLimit-Count-Total"] = math.floor(responseTotal.count)
-	        		--ngx.header["X-RateLimit-Reset-Total"] = math.floor(responseTotal.reset)
-				--if enforce_limit then
-				--    ngx.header["X-RateLimit-Enforce-Limit"] = "true"
-				--else
-				--    ngx.header["X-RateLimit-Enforce-Limit"] = "false"
-				--end
 				-- Return connection in pool
     				local ok, error = connection:set_keepalive(60000, redis_pool_size)
     				if not ok then
@@ -219,12 +187,6 @@ function _M.limit(config)
 	            	ngx.exit(ngx.HTTP_OK)
 		end
         else
-        	--local responseTotal, error = bump_request(connection, redis_pool_size, "Total", rateTotalDec, intervalTotal, current_time, log_level)
-		--unset_lock(connection)
-		--if not responseTotal then
-			--ngx.log(log_level, "Err: responseTotal: ", error)
-			--return
-		--end
 	    	if overlimit(connection, key, rateTotal, intervalTotal, log_level) then 
 	    		local retry_after = math.floor(response.reset - current_time)
 	    		if retry_after < 0 then
@@ -236,7 +198,6 @@ function _M.limit(config)
 	    		ngx.header["Retry-After"] = retry_after
 	    		ngx.status = 429
 	    		ngx.say('{"status_code":25,"status_message":"Your request count (' .. response.count .. ') is over the allowed limit of ' .. rate .. '."}')
-            		--ngx.log(log_level, "OverLimit: ", response.count)
 	        	-- Return connection in pool
     	        	local ok, error = connection:set_keepalive(60000, redis_pool_size)
     	        	if not ok then
@@ -248,14 +209,6 @@ function _M.limit(config)
 			ngx.header["X-RateLimit-Remaining"] = math.floor(response.remaining)
 			ngx.header["X-RateLimit-Reset"] = math.floor(response.reset)
 			ngx.header["X-RateLimit-Limit-Total"] = rateTotalDec
-			--ngx.header["X-RateLimit-Remaining-Total"] = math.floor(responseTotal.remaining)
-			--ngx.header["X-RateLimit-Count-Total"] = math.floor(responseTotal.count)
-			--ngx.header["X-RateLimit-Reset-Total"] = math.floor(responseTotal.reset)
-			--if enforce_limit then
-			--    ngx.header["X-RateLimit-Enforce-Limit"] = "true"
-			--else
-			--    ngx.header["X-RateLimit-Enforce-Limit"] = "false"
-			--end
 			-- Return connection in pool
 			local ok, error = connection:set_keepalive(60000, redis_pool_size)
 			if not ok then
